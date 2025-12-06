@@ -1,0 +1,309 @@
+import pandas as pd
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.ensemble import AdaBoostClassifier
+from sklearn.feature_extraction.text import CountVectorizer
+from nltk.corpus import stopwords
+from collections import Counter
+import nltk
+import requests
+import textwrap
+from bs4 import BeautifulSoup
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
+import numpy as np
+import re
+from imblearn.over_sampling import RandomOverSampler
+
+# Tente importar a biblioteca de PDF. Se falhar, o código de treino ainda roda.
+try:
+    import pypdf
+except ImportError:
+    print("AVISO: A biblioteca 'pypdf' não está instalada. A função de análise de PDF pode falhar. Instale com 'pip install pypdf'.")
+    pypdf = None
+
+# Defina a SEED (Chave para a separação dos dados)
+NOVA_SEED = 123
+
+# --- CORREÇÃO DO BLOCO DE DOWNLOAD DO NLTK ---
+# Baixa stopwords
+try:
+    # Tenta encontrar o recurso (isto deve falhar se não estiver baixado)
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    # Se der LookupError (recurso não encontrado), faz o download.
+    print("Recurso 'stopwords' não encontrado. Realizando o download...")
+    nltk.download('stopwords')
+
+stopwords_pt = stopwords.words('portuguese')
+# ---------------------------------------------
+
+# =======================================================
+# *** LÓGICA DE TREINAMENTO: PREVENÇÃO DE VAZAMENTO DE DADOS (DATA LEAKAGE) ***
+# =======================================================
+
+# 1. Ajuste de Stopwords e Pistas Falsas
+stopwords_pt.append('numero') # Neutraliza a pista trivial de números (CPF, Telefone, Idade)
+
+# Lista de nomes e domínios de e-mail identificados como vazamento no início do projeto
+palavras_vazadas = [
+    'ana', 'andrade', 'batista', 'beatriz', 'claudia', 'cláudia', 'duarte', 'eduardo', 'fernanda',
+    'freitas', 'gabbriela', 'joao', 'joão', 'juliana', 'lemos', 'marcos', 'maria', 'melo',
+    'morais', 'pedro', 'pires', 'ramos', 'roberto', 'rodrigues', 'rogério', 'asilva', 'tatiane',
+    'br', 'edu', 'gamail', 'gov', 'outlook', 'protonmail',
+]
+stopwords_pt.extend(palavras_vazadas)
+
+# Inserção dos 50 falsos positivos (para quebrar a correlação entre palavras contextuais e o rótulo 'sim')
+novas_amostras_nao = pd.DataFrame([
+    ["O munícipe João Silva fez uma pergunta genérica sobre o plano diretor.", "não"],
+    ["A servidora foi orientada sobre a nova regra para registro de ponto eletrônico.", "não"],
+    ["A prefeitura recebeu uma solicitação de informação sobre o calendário de vacinação.", "não"],
+    ["Houve uma reclamação geral sobre o horário de atendimento da secretaria.", "não"],
+    ["A moradora do bairro Vila Nova sugeriu uma nova rota para a linha de ônibus.", "não"],
+    ["A munícipe participou de uma audiência pública para discutir problemas da zona sul.", "não"],
+    ["O servidor público divulgou o cronograma de manutenção de veículos da frota municipal.", "não"],
+    ["O cidadão registrou uma sugestão para a ampliação do programa de arborização.", "não"],
+    ["A senhora Ana Paula fez uma pergunta sobre o novo projeto de lei municipal.", "não"],
+    ["O morador da Rua XV de Novembro participou de uma entrevista sobre as obras.", "não"],
+    ["A diretora da escola fez uma solicitação formal para a troca do telhado.", "não"],
+    ["O munícipe Rogério Pires foi citado por ter participado da campanha de doação.", "não"],
+    ["Uma moradora da Avenida Brasil relatou sua experiência positiva com o serviço.", "não"],
+    ["A reclamação sobre o estado das calçadas foi notificada pela imprensa local.", "não"],
+    ["O secretário de obras informou que o reparo da via será realizado na próxima semana.", "não"],
+    ["Um residente do Jardim América enviou uma carta de agradecimento à prefeitura.", "não"],
+    ["A prefeitura promoveu um evento de capacitação para novos servidores.", "não"],
+    ["O cidadão compareceu ao encontro para discutir a implantação de ciclovias.", "não"],
+    ["Durante a feira de saúde, um munícipe perguntou sobre o plano de vacinação.", "não"],
+    ["A senhora Maria Lemos foi a palestrante do evento sobre educação ambiental.", "não"],
+    ["A ouvidoria recebeu a reclamação do munícipe sobre o barulho, mas sem identificação.", "não"],
+    ["O servidor recebeu capacitação para atender solicitações de forma mais rápida.", "não"],
+    ["A munícipe Tânia registrou a informação da alteração de horário no conselho.", "não"],
+    ["A secretaria avaliou o pedido de reparo na via principal da Vila Nova.", "não"],
+    ["O projeto de voluntariado contou com a participação de diversos cidadãos.", "não"],
+    ["O morador da Boa Vista elogiou o trabalho da equipe de manutenção.", "não"],
+    ["A moradora Júlia perguntou sobre as obras na Rua das Flores.", "não"],
+    ["O evento da Quinta da Boa Vista foi um sucesso de público.", "não"],
+    ["A munícipe Lúcia registrou a reclamação sobre o lixo na praça.", "não"],
+    ["O servidor João foi designado para a nova função de diretor.", "não"],
+    ["O cidadão André participou ativamente da audiência pública.", "não"],
+    ["O morador do Jardim América fez uma sugestão sobre o novo plano.", "não"],
+    ["A prefeitura recebeu uma solicitação para a limpeza de bueiros.", "não"],
+    ["O servidor público demonstrou a importância do contato com a população.", "não"],
+    ["A munícipe Maria fez uma reclamação sobre o estado do asfalto.", "não"],
+    ["O vereador solicitou informações sobre o evento de final de ano.", "não"],
+    ["O morador registrou queixas sobre o mau cheiro no bairro.", "não"],
+    ["A senhora Lúcia Modesto participou da oficina de arte.", "não"],
+    ["O cidadão Pedro Souza fez uma pergunta à coordenação do projeto.", "não"],
+    ["A prefeitura promoveu um encontro com o munícipe para esclarecer dúvidas.", "não"],
+    ["O servidor Batista foi o responsável pela organização do mutirão.", "não"],
+    ["A moradora Ana relatou sua preocupação com a segurança pública.", "não"],
+    ["O plano de ação da prefeitura foi amplamente divulgado.", "não"],
+    ["O diretor da escola enviou uma carta de agradecimento.", "não"],
+    ["A reclamação do morador foi encaminhada para o setor responsável.", "não"],
+    ["A munícipe fez a solicitação de forma anônima, sem identificação.", "não"],
+    ["O servidor de plantão atendeu a todas as dúvidas dos moradores.", "não"],
+    ["A moradora Cláudia relatou um problema de queda de árvore.", "não"],
+    ["O cidadão solicitou um mapa da região central da cidade.", "não"],
+    ["O servidor Eduardo foi designado para o reparo da iluminação.", "não"],
+], columns=['texto', 'rotulo'])
+
+
+# 2. Carregamento e Pré-processamento
+df = pd.read_csv("dataset_prefeituras_html_realista_limpo.csv")
+df.dropna(inplace=True)
+df_corrigido = pd.concat([df, novas_amostras_nao], ignore_index=True)
+df = df_corrigido.sample(frac=1, random_state=NOVA_SEED).reset_index(drop=True)
+
+# Limpeza e Normalização Numérica
+df['texto'] = df['texto'].str.replace(r'["“”]', '', regex=True)
+df['texto'] = df['texto'].str.replace(r'[^\w\s]', ' ', regex=True)
+df['texto'] = df['texto'].apply(lambda x: re.sub(r'\d+', ' NUMERO ', x))
+df['texto'] = df['texto'].str.replace(r'\s+', ' ', regex=True).str.strip()
+
+X_df = df['texto'].astype(str)
+Y = df['rotulo'].astype(str).values
+
+# 3. Divisão dos Dados (com nova seed)
+X_temp, X_validacao_teste, Y_temp, Y_validacao_teste = train_test_split(
+    X_df, Y, test_size=0.2, random_state=NOVA_SEED, stratify=Y
+)
+X_teste, X_validacao, Y_teste, Y_validacao = train_test_split(
+    X_validacao_teste, Y_validacao_teste, test_size=0.5, random_state=NOVA_SEED, stratify=Y_validacao_teste
+)
+
+# 4. Vetorização (fit APENAS no treino)
+vectorizer = CountVectorizer(stop_words=stopwords_pt, token_pattern=r'(?u)\b\w\w+\b')
+X_treino_vetorizado = vectorizer.fit_transform(X_temp).toarray()
+
+# 5. Balanceamento de Classe (OVERSAMPLING)
+ros = RandomOverSampler(random_state=NOVA_SEED)
+X_treino_balanceado, Y_treino_balanceado = ros.fit_resample(X_treino_vetorizado, Y_temp)
+
+X_teste_vetorizado = vectorizer.transform(X_teste).toarray()
+X_validacao_vetorizado = vectorizer.transform(X_validacao).toarray()
+X_completo = vectorizer.transform(X_df).toarray()
+Y_completo = Y
+
+# --- Funções de Treinamento e Avaliação ---
+def fit_and_predict(nome, modelo, treino_dados, treino_marcacoes, teste_dados, teste_marcacoes, X_completo, Y_completo, k=5):
+    modelo.fit(treino_dados, treino_marcacoes)
+    resultado = modelo.predict(teste_dados)
+    taxa_de_acerto = 100.0 * sum(resultado == teste_marcacoes) / len(teste_dados)
+    print(f"\nTaxa de acerto do algoritmo {nome} (teste fixo): {taxa_de_acerto:.2f}%")
+    kf = KFold(n_splits=k, shuffle=True, random_state=NOVA_SEED)
+    scores = cross_val_score(modelo, X_completo, Y_completo, cv=kf, scoring='accuracy')
+    print(f"{nome} - K-Fold ({k} folds)")
+    print(f"Acurácia média: {np.mean(scores):.2f}")
+    return taxa_de_acerto, np.mean(scores)
+
+def avaliar_modelo_validacao_metricas(modelo, validacao_dados, validacao_marcacoes):
+    y_true = validacao_marcacoes
+    y_pred = modelo.predict(validacao_dados)
+    acuracia = accuracy_score(y_true, y_pred)
+    precisao = precision_score(y_true, y_pred, pos_label='sim', zero_division=0)
+    recall = recall_score(y_true, y_pred, pos_label='sim', zero_division=0)
+    f1 = f1_score(y_true, y_pred, pos_label='sim', zero_division=0)
+    print("\n--- Métricas do modelo no conjunto de VALIDAÇÃO ---")
+    print(f"Acurácia: {acuracia:.4f}")
+    print(f"Precisão: {precisao:.4f}")
+    print(f"Recall:   {recall:.4f}")
+    print(f"F1-score: {f1:.4f}")
+
+# 6. Treinamento e Escolha do Vencedor
+resultadoMultinomial, mediaMultinomial = fit_and_predict("MultinomialNB", MultinomialNB(), X_treino_balanceado, Y_treino_balanceado, X_teste_vetorizado, Y_teste, X_completo, Y_completo, k=5)
+resultadoAdaBoost, mediaAdaBoost = fit_and_predict("AdaBoostClassifier", AdaBoostClassifier(random_state=NOVA_SEED), X_treino_balanceado, Y_treino_balanceado, X_teste_vetorizado, Y_teste, X_completo, Y_completo, k=5)
+
+if mediaMultinomial > mediaAdaBoost:
+    vencedor = MultinomialNB().fit(X_treino_balanceado, Y_treino_balanceado)
+    print("\nMultinomialNB venceu pelo K-Fold!")
+else:
+    vencedor = AdaBoostClassifier(random_state=NOVA_SEED).fit(X_treino_balanceado, Y_treino_balanceado)
+    print("\nAdaBoostClassifier venceu pelo K-Fold!")
+
+avaliar_modelo_validacao_metricas(vencedor, X_validacao_vetorizado, Y_validacao)
+
+# =======================================================
+# *** FUNÇÕES DE ANÁLISE ***
+# =======================================================
+
+def analisar_site(url, vencedor, vectorizer):
+    """Extrai texto de um URL, pré-processa e classifica em blocos."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36'}
+        resposta = requests.get(url, timeout=5, headers=headers)
+        sopa = BeautifulSoup(resposta.text, 'html.parser')
+
+        texto_visivel = sopa.get_text(separator=' ').lower()
+        scripts = sopa.find_all('script')
+        conteudo_scripts = ' '.join(script.string or '' for script in scripts if script.string)
+
+        texto_completo = texto_visivel + ' ' + conteudo_scripts
+        texto_completo = ' '.join(texto_completo.split())
+
+        # Aplica a MESMA LIMPEZA DO TREINAMENTO
+        texto_limpo = re.sub(r'["“”]', '', texto_completo)
+        texto_limpo = re.sub(r'[^\w\s]', ' ', texto_limpo)
+        texto_limpo = re.sub(r'\d+', ' NUMERO ', texto_limpo)
+        texto_limpo = re.sub(r'\s+', ' ', texto_limpo).strip()
+
+        # Divide em blocos para granularidade
+        blocos = textwrap.wrap(texto_limpo, width=300, break_long_words=False, break_on_hyphens=False)
+
+        if not blocos:
+            print("O site não retornou texto legível após o pré-processamento.")
+            return
+
+        blocos_transformados = vectorizer.transform(blocos)
+        resultados = vencedor.predict(blocos_transformados)
+
+        total_sim = list(resultados).count('sim')
+
+        print(f"\n--- Análise do Site: {url} ---")
+        print(f"Total de blocos analisados: {len(blocos)}")
+        print(f"Blocos classificados como SENSÍVEIS: {total_sim}")
+
+        print("\n=== Blocos SENSÍVEIS (SIM) ===")
+        blocos_sim = [bloco for bloco, r in zip(blocos, resultados) if r == 'sim']
+
+        if blocos_sim:
+            for i, bloco in enumerate(blocos_sim):
+                print(f"\n[BLOCO SIM {i+1}]:")
+                print(bloco.strip())
+        else:
+            print("Nenhum dado sensível identificado no conteúdo do site.")
+
+    except Exception as e:
+        print(f"Erro ao acessar ou processar o site: {e}")
+
+
+def analisar_pdf(pdf_file_path, vencedor, vectorizer):
+    """Extrai texto do PDF, pré-processa e classifica em blocos."""
+    if pypdf is None:
+        print("\nERRO: A biblioteca 'pypdf' não está disponível. Não é possível analisar o PDF. Instale com 'pip install pypdf'.")
+        return
+
+    print(f"\n--- Iniciando a Análise do PDF: {pdf_file_path} ---")
+
+    # 1. Extração do Texto
+    texto_completo = ""
+    try:
+        with open(pdf_file_path, "rb") as file:
+            reader = pypdf.PdfReader(file)
+            for page in reader.pages:
+                texto_completo += page.extract_text() + " "
+    except FileNotFoundError:
+        print(f"Erro: Arquivo {pdf_file_path} não encontrado. Verifique o caminho.")
+        return
+    except Exception as e:
+        print(f"Erro ao processar o PDF: {e}")
+        return
+
+    # 2. Pré-processamento (MESMA LÓGICA DO TREINAMENTO)
+    texto_completo = texto_completo.lower()
+    texto_limpo = re.sub(r'["“”]', '', texto_completo)
+    texto_limpo = re.sub(r'[^\w\s]', ' ', texto_limpo)
+    texto_limpo = re.sub(r'\d+', ' NUMERO ', texto_limpo) # Normalização Numérica
+    texto_limpo = re.sub(r'\s+', ' ', texto_limpo).strip()
+
+    # 3. Divisão em Blocos (para granularidade)
+    blocos = textwrap.wrap(texto_limpo, width=300, break_long_words=False, break_on_hyphens=False)
+
+    if not blocos:
+        print("O PDF está vazio ou não contém texto legível após o pré-processamento.")
+        return
+
+    # 4. Vetorização e Classificação
+    blocos_transformados = vectorizer.transform(blocos)
+    resultados = vencedor.predict(blocos_transformados)
+
+    total_sim = list(resultados).count('sim')
+
+    print(f"\nTotal de blocos analisados: {len(blocos)}")
+    print(f"Blocos classificados como SENSÍVEIS ('sim'): {total_sim}")
+
+    # 5. Visualização dos Resultados
+    print("\n=== Blocos Classificados como SIM (Potencialmente Sensíveis) ===")
+    blocos_sim = [bloco for bloco, r in zip(blocos, resultados) if r == 'sim']
+
+    if blocos_sim:
+        for i, bloco in enumerate(blocos_sim):
+            print(f"\n[BLOCO SIM {i+1}]:")
+            print(bloco.strip())
+        print("\nRecomendação: Verifique manualmente os blocos acima por possível exposição de CPF, e-mail ou dados pessoais.")
+    else:
+        print("Nenhum bloco classificado como SIM (possível dado sensível) no PDF.")
+
+# =======================================================
+# *** EXEMPLOS DE EXECUÇÃO ***
+# =======================================================
+
+print("\n\n#####################################################")
+print("### INÍCIO DOS TESTES DE ANÁLISE (Site e PDF) ###")
+print("#####################################################")
+
+# Exemplo de uso da análise de site
+analisar_site("https://portal.barueri.sp.gov.br/", vencedor, vectorizer)
+
+# Exemplo de uso da análise de PDF
+# ATENÇÃO: Descomente a linha abaixo e insira o caminho para o seu arquivo PDF de teste.
+analisar_pdf('relatorio_teste.pdf', vencedor, vectorizer)
