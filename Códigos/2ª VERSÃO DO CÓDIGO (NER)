@@ -1,0 +1,209 @@
+import pandas as pd
+from sklearn.ensemble import AdaBoostClassifier
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+from transformers import pipeline
+import re
+import pypdf # Importação de pypdf mantida no topo
+from collections import Counter
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+import textwrap
+
+# Defina a SEED e carregue o dataset
+NOVA_SEED = 123
+df = pd.read_csv("dataset_prefeituras_html_realista_limpo.csv")
+df.dropna(inplace=True)
+
+# ----------------------------------------------------------------------
+# 1. FUNÇÃO DE EXTRAÇÃO DE FEATURES COM NER
+# ----------------------------------------------------------------------
+
+# CORREÇÃO: Usando um modelo multilíngue de NER para evitar o erro de dimensão
+# e melhorar a extração de features (PER, LOC, ORG).
+MODELO_NER = "Babelscape/wikineural-multilingual-ner"
+
+try:
+    ner_pipeline = pipeline("ner",
+                            model=MODELO_NER,
+                            tokenizer=MODELO_NER,
+                            aggregation_strategy="simple")
+    print(f"Pipeline de NER com Transformers ({MODELO_NER}) inicializado com sucesso.")
+except Exception as e:
+    print(f"Erro ao inicializar o pipeline de NER: {e}. Certifique-se de ter 'transformers' e 'torch' instalados.")
+    ner_pipeline = None
+
+# Funções de limpeza mantidas
+def limpar_texto(texto):
+    texto = texto.lower()
+    texto = re.sub(r'["“”]', '', texto)
+    texto = re.sub(r'[^\w\s@\.]', ' ', texto) # Mantém @ e . para e-mails
+    texto = re.sub(r'\s+', ' ', texto).strip()
+    return texto
+
+def extrair_features_ner(textos):
+    if ner_pipeline is None:
+        # Se o pipeline falhou, retorna features vazias para não quebrar o código
+        return np.zeros((len(textos), 4))
+
+    features_lista = []
+
+    for texto in textos:
+        texto_limpo = limpar_texto(texto)
+
+        # 1. Aplica o NER e extrai as entidades
+        entidades = ner_pipeline(texto_limpo)
+
+        # 2. Converte as entidades em Features Numéricas
+        # Contagem de tipos de entidades que são mais prováveis de ser sensíveis
+        count_org = 0 # Organizações
+        count_person = 0 # Nomes de Pessoas
+        count_loc = 0 # Localização
+
+        for ent in entidades:
+            # Os rótulos do modelo 'Babelscape' são ligeiramente diferentes (ex: PER, LOC, ORG)
+            if 'ORG' in ent['entity_group']:
+                count_org += 1
+            elif 'PER' in ent['entity_group']:
+                count_person += 1
+            elif 'LOC' in ent['entity_group']:
+                count_loc += 1
+
+        # 3. Features baseadas em Padrão (para dados que NER puro falha, como CPF/Email)
+        # Expressão regular para e-mail
+        email_encontrado = 1 if re.search(r'\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b', texto.lower()) else 0
+
+        # Expressão regular para CPF/Telefone
+        num_longo_encontrado = 1 if re.search(r'\d{3}[\s.-]\d{3}[\s.-]\d{3}[\s.-]\d{2}|\d{9,}', texto) else 0
+
+        # Adiciona as features: (Nome, Localização, Email, Número Longo)
+        features_lista.append([count_person, count_loc, email_encontrado, num_longo_encontrado])
+
+    return np.array(features_lista)
+
+# ----------------------------------------------------------------------
+# 2. PREPARAÇÃO DO DATASET DE CLASSIFICAÇÃO (Com Features NER)
+# ----------------------------------------------------------------------
+
+X_df = df['texto'].astype(str)
+Y = df['rotulo'].astype(str).values
+
+# Aplica a função de extração de features
+print("Extraindo features do dataset com NER. Isso pode levar alguns minutos...")
+X_features = extrair_features_ner(X_df)
+
+# Divide os dados de Features
+X_treino, X_temp, Y_treino, Y_temp = train_test_split(
+    X_features, Y, test_size=0.2, random_state=NOVA_SEED, stratify=Y
+)
+X_teste, X_validacao, Y_teste, Y_validacao = train_test_split(
+    X_temp, Y_temp, test_size=0.5, random_state=NOVA_SEED, stratify=Y_temp
+)
+
+print(f"\nFeatures de Treino: {X_treino.shape}")
+print(f"Features de Validação: {X_validacao.shape}")
+
+# ----------------------------------------------------------------------
+# 3. TREINAMENTO E AVALIAÇÃO DO CLASSIFICADOR (AdaBoost no topo da NER)
+# ----------------------------------------------------------------------
+
+# AdaBoostClassifier treinado com as features numéricas da NER
+modelo_ner = AdaBoostClassifier(random_state=NOVA_SEED)
+modelo_ner.fit(X_treino, Y_treino)
+
+# Avaliação no conjunto de Validação
+y_pred = modelo_ner.predict(X_validacao)
+
+acuracia = accuracy_score(Y_validacao, y_pred)
+f1 = f1_score(Y_validacao, y_pred, pos_label='sim')
+
+print("\n--- Resultados do Classificador (AdaBoost) usando Features NER ---")
+print(f"Acurácia na Validação: {acuracia:.4f}")
+print(f"F1-Score na Validação: {f1:.4f}")
+
+# ----------------------------------------------------------------------
+# 4. FUNÇÕES DE ANÁLISE COM NER (Substituição de Vectorizer e Modelo)
+# ----------------------------------------------------------------------
+
+def analisar_site_ner(url, modelo_ner):
+    """Extrai texto de um URL, extrai features NER e classifica."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36'}
+        resposta = requests.get(url, timeout=5, headers=headers)
+        sopa = BeautifulSoup(resposta.text, 'html.parser')
+        texto_completo = sopa.get_text(separator=' ').lower()
+        texto_completo = ' '.join(texto_completo.split())
+
+        # 1. Extrai features NER do texto completo do site
+        X_novo = extrair_features_ner([texto_completo])
+
+        # 2. Classifica
+        resultado = modelo_ner.predict(X_novo)[0]
+
+        print(f"\n--- Análise do Site com NER: {url} ---")
+        print(f"Resultado da Classificação: {resultado.upper()}")
+        if resultado == 'sim':
+            print("AVISO: O site provavelmente contém informações sensíveis de identificação pessoal.")
+        else:
+            print("O site não parece conter informações sensíveis de identificação pessoal.")
+
+    except Exception as e:
+        print(f"Erro ao acessar ou processar o site: {e}")
+
+
+def analisar_pdf_ner(pdf_file_path, modelo_ner):
+    """Extrai texto do PDF, extrai features NER e classifica."""
+
+    # CORREÇÃO: Usa pypdf importado globalmente. Se a importação falhou,
+    # a função deve parar aqui para evitar o UnboundLocalError.
+    if 'pypdf' not in globals() and 'pypdf' not in locals():
+        print("\nERRO: A biblioteca 'pypdf' não está disponível. Não é possível analisar o PDF.")
+        return
+
+    # 1. Extração do Texto
+    texto_completo = ""
+    try:
+        with open(pdf_file_path, "rb") as file:
+            reader = pypdf.PdfReader(file)
+            for page in reader.pages:
+                texto_completo += page.extract_text() + " "
+    except FileNotFoundError:
+        print(f"Erro: Arquivo {pdf_file_path} não encontrado. Verifique o caminho.")
+        return
+    except Exception as e:
+        print(f"Erro ao processar o PDF: {e}")
+        return
+
+    if not texto_completo.strip():
+        print("O PDF está vazio ou não contém texto legível.")
+        return
+
+    # 2. Extrai features NER do texto completo do PDF
+    X_novo = extrair_features_ner([texto_completo])
+
+    # 3. Classifica
+    resultado = modelo_ner.predict(X_novo)[0]
+
+    print(f"\n--- Análise do PDF com NER: {pdf_file_path} ---")
+    print(f"Resultado da Classificação: {resultado.upper()}")
+    if resultado == 'sim':
+        print("AVISO: O PDF provavelmente contém informações sensíveis de identificação pessoal.")
+    else:
+        print("O PDF não parece conter informações sensíveis de identificação pessoal.")
+
+# ----------------------------------------------------------------------
+# 5. EXEMPLOS DE EXECUÇÃO
+# ----------------------------------------------------------------------
+
+print("\n\n#####################################################")
+print("### INÍCIO DOS TESTES DE ANÁLISE (Site e PDF) COM NER ###")
+print("#####################################################")
+
+# O modelo 'vencedor' agora é 'modelo_ner'
+analisar_site_ner("https://portal.barueri.sp.gov.br", modelo_ner)
+
+# Exemplo de uso da análise de PDF
+# NOTA: O arquivo 'relatorio_teste.pdf' precisa existir no ambiente para funcionar.
+analisar_pdf_ner('relatorio_teste.pdf', modelo_ner)
