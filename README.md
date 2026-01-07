@@ -59,6 +59,12 @@ Os resultados encontram-se organizados na pasta.
 
 ## 📁 Estrutura do Repositório
 
+O repositório está estruturado da seguinte forma :
+- Códigos : Contém a 1ª Versão pronta do código  e 2ª Versão utilizando o NER.
+- Datasets : Contém os dados/arquivos csv que foram utilizados, sendo possível identifica-los no código por seus respectivos nomes.
+- Links e pdfs : Contém os links e pdfs utilizados para o uso da função de análise de site e pdf, sendo possível identifica-los no código por seus respectivos nomes.
+- Resultados : Contém capturas da tela de saída da execução dos códigos, conforme a versão de cada um. Além disso, a imagem de uma tabela comparativa antes das repectivas versões finais.
+  
 
 ---
 
